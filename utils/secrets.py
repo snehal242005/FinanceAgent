@@ -1,8 +1,5 @@
 # ─── utils/secrets.py ─────────────────────────────────────────────────────────
-"""
-Unified secret loader.
-Priority: Streamlit Cloud secrets -> .env file (local) -> environment variable
-"""
+"""Unified secret loader: Streamlit Cloud → .env → env variable"""
 
 import os
 from dotenv import load_dotenv
@@ -19,6 +16,5 @@ def get_openai_key() -> str | None:
             return key
     except Exception:
         pass
-
-    # 2. .env / OS environment variable
+    # 2. .env / environment variable
     return os.getenv("OPENAI_API_KEY")

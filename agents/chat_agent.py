@@ -1,161 +1,139 @@
 # ─── agents/chat_agent.py ─────────────────────────────────────────────────────
 """
-Chat Agent — GPT-4o powered conversational stock assistant
-Fetches live news + price data and answers user questions in real time.
-Maintains conversation memory within the Streamlit session.
+ChatAgent — GPT-4o powered stock market chatbot.
+Fetches live news + price data and answers user questions intelligently.
 """
 
-import json
+import re
 from datetime import datetime
 from openai import OpenAI
 from agents.data_agent import DataAgent
 from utils.secrets import get_openai_key
 
-
-SYSTEM_PROMPT = """You are FinanceBot, an expert AI stock market analyst and financial advisor assistant.
-
-You have access to real-time stock data and current news fetched from Yahoo Finance.
-Your role is to:
-1. Answer questions about stocks, markets, and investments clearly
-2. Interpret live news and explain how it affects stock prices
-3. Give BUY / HOLD / SELL opinions when asked, with clear reasoning
-4. Explain financial concepts in simple language
-5. Warn users when data is uncertain or when professional advice is needed
-
-Always be:
-- Specific (mention actual numbers, dates, companies)
-- Balanced (mention both upside and risks)
-- Clear (avoid jargon unless explained)
-
-End every response with a one-line disclaimer if giving investment opinions.
-Today's date: {date}
-"""
+COMMON_WORDS = {
+    "I","A","AN","THE","AND","OR","IS","IN","ON","AT","TO","FOR","OF","WITH",
+    "BUY","SELL","HOLD","WHAT","HOW","WHY","WHEN","WHO","CAN","WILL","DO",
+    "MY","ME","US","WE","IT","BE","BY","IF","UP","AS","SO","NO","GO","GET",
+    "ARE","WAS","HAS","HAD","NOW","NEW","ALL","TOP","GDP","IPO","ETF","USA",
+    "AI","API","ML","AM","PM","CEO","CFO","CTO","PE","EPS","ATH","ATL","RSI",
+}
 
 
 class ChatAgent:
     def __init__(self):
-        self.name = "Chat Agent (GPT-4o)"
+        self.name = "TradeXAI Chatbot (GPT-4o)"
         api_key = get_openai_key()
         self.client = OpenAI(api_key=api_key) if api_key else None
-        self.available = self.client is not None
         self.data_agent = DataAgent()
+        self.available = self.client is not None
 
     # ── Ticker detection ────────────────────────────────────────────────────────
-    def _extract_tickers(self, text: str) -> list[str]:
-        """Detect stock tickers mentioned in user message."""
-        import re
-        # Match words that look like tickers (2-5 uppercase letters)
-        words = re.findall(r'\b[A-Z]{2,5}\b', text.upper())
-        # Common known tickers to validate against
-        known = {
-            "AAPL","GOOGL","GOOG","MSFT","AMZN","TSLA","NVDA","META","NFLX","AMD",
-            "INTC","BABA","JPM","BAC","GS","MS","V","MA","PYPL","DIS","UBER","LYFT",
-            "SNAP","TWTR","COIN","HOOD","PLTR","RBLX","ABNB","SHOP","SQ","ROKU",
-            "ZM","PTON","DOCU","CRWD","OKTA","DDOG","NET","SNOW","MSTR","SPY",
-            "QQQ","VTI","VOO","IWM","ARKK","GLD","SLV","BTC","ETH"
-        }
-        return list(set(w for w in words if w in known))[:3]  # max 3 tickers
+    def extract_tickers(self, text: str) -> list[str]:
+        """Pull likely stock tickers from the user message."""
+        # $TICKER style
+        dollar = re.findall(r'\$([A-Z]{1,5})', text.upper())
+        # STANDALONE CAPS words 1-5 chars
+        caps = re.findall(r'\b([A-Z]{1,5})\b', text.upper())
+        candidates = list(dict.fromkeys(dollar + caps))  # dedupe, preserve order
+        return [t for t in candidates if t not in COMMON_WORDS and len(t) >= 2][:3]
 
     # ── Live context builder ────────────────────────────────────────────────────
-    def _build_live_context(self, tickers: list[str]) -> str:
-        if not tickers:
-            return ""
+    def _build_context(self, message: str) -> str:
+        tickers = self.extract_tickers(message)
         context_parts = []
+
         for ticker in tickers:
             try:
-                price_info = self.data_agent.fetch_current_price(ticker)
+                # Price
+                price = self.data_agent.fetch_current_price(ticker)
+                if price and price.get("current_price"):
+                    prev = price.get("previous_close", price["current_price"])
+                    chg = price["current_price"] - prev
+                    pct = (chg / prev * 100) if prev else 0
+                    context_parts.append(
+                        f"[LIVE] {ticker}: ${price['current_price']:.2f} "
+                        f"({chg:+.2f} / {pct:+.2f}%)"
+                    )
+
+                # News
                 news = self.data_agent.fetch_news(ticker, max_articles=5)
-
-                price_text = ""
-                if price_info:
-                    cur = price_info.get("current_price", "N/A")
-                    prev = price_info.get("previous_close", "N/A")
-                    if isinstance(cur, float) and isinstance(prev, float):
-                        chg = cur - prev
-                        chg_pct = (chg / prev * 100) if prev else 0
-                        price_text = f"Current: ${cur:.2f} ({chg_pct:+.2f}% vs yesterday)"
-                    else:
-                        price_text = f"Current: ${cur}"
-
-                news_text = ""
                 if news:
-                    headlines = [f"  - {a['title']} ({a.get('published','')[:16]})"
-                                 for a in news[:5]]
-                    news_text = "Latest News:\n" + "\n".join(headlines)
+                    context_parts.append(f"[LATEST NEWS for {ticker}]")
+                    for n in news[:4]:
+                        context_parts.append(f"  • {n['title']} ({n.get('published','')})")
+            except Exception:
+                pass
 
-                context_parts.append(
-                    f"=== {ticker} ===\n{price_text}\n{news_text}"
-                )
-            except Exception as e:
-                context_parts.append(f"=== {ticker} === (data unavailable: {e})")
+        return "\n".join(context_parts)
 
-        return "\n\n".join(context_parts)
+    # ── General market news ─────────────────────────────────────────────────────
+    def _general_market_news(self) -> str:
+        try:
+            import feedparser
+            feed = feedparser.parse("https://feeds.a.dj.com/rss/RSSMarketsMain.xml")
+            lines = ["[GENERAL MARKET NEWS]"]
+            for e in feed.entries[:5]:
+                lines.append(f"  • {e.get('title','')}")
+            return "\n".join(lines)
+        except Exception:
+            return ""
 
-    # ── Main chat ───────────────────────────────────────────────────────────────
-    def chat(self, user_message: str, history: list[dict]) -> dict:
+    # ── Chat ────────────────────────────────────────────────────────────────────
+    def chat(self, history: list[dict], user_message: str) -> str:
         """
-        Send a message and get a response.
-        history: list of {"role": "user"|"assistant", "content": "..."}
-        Returns: {"reply": str, "tickers_fetched": list, "context_used": bool}
+        history: list of {"role": "user"|"assistant", "content": "..."} dicts
+        Returns assistant reply string.
         """
         if not self.available:
-            return {
-                "reply": "ChatAgent is unavailable — please add your OpenAI API key to the .env file.",
-                "tickers_fetched": [],
-                "context_used": False,
-            }
+            return (
+                "TradeXAI Chatbot requires an OpenAI API key. "
+                "Please add your key to the .env file."
+            )
 
-        # Detect tickers and fetch live data
-        tickers = self._extract_tickers(user_message)
-        # Also check recent history for tickers
-        if not tickers and history:
-            for msg in history[-3:]:
-                tickers = self._extract_tickers(msg.get("content", ""))
-                if tickers:
-                    break
+        # Build live context
+        live_ctx = self._build_context(user_message)
+        if not live_ctx:
+            live_ctx = self._general_market_news()
 
-        live_context = self._build_live_context(tickers)
+        system_prompt = f"""You are TradeXAI, a world-class AI stock market assistant.
+You have access to live market data and the latest financial news.
+Today: {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}
 
-        # Build system message
-        system = SYSTEM_PROMPT.format(date=datetime.now().strftime("%Y-%m-%d"))
-        if live_context:
-            system += f"\n\n--- LIVE MARKET DATA (fetched now) ---\n{live_context}\n---"
+LIVE MARKET DATA:
+{live_ctx if live_ctx else 'No specific ticker data fetched. Provide general market knowledge.'}
 
-        # Build messages
-        messages = [{"role": "system", "content": system}]
-        # Add history (last 10 turns to stay within token limits)
-        messages.extend(history[-10:])
+Guidelines:
+- Answer concisely and professionally
+- Use bullet points for lists
+- Always mention when data is approximate or delayed
+- Remind users this is NOT financial advice for investment decisions
+- For specific tickers, refer to the live data above
+- If asked for news, summarize the headlines above
+- Be conversational but expert"""
+
+        messages = [{"role": "system", "content": system_prompt}]
+        # Include last 6 turns of history for context
+        messages += history[-6:]
         messages.append({"role": "user", "content": user_message})
 
         try:
             response = self.client.chat.completions.create(
                 model="gpt-4o",
                 messages=messages,
-                temperature=0.5,
-                max_tokens=800,
+                temperature=0.6,
+                max_tokens=600,
             )
-            reply = response.choices[0].message.content.strip()
-            return {
-                "reply": reply,
-                "tickers_fetched": tickers,
-                "context_used": bool(live_context),
-            }
+            return response.choices[0].message.content.strip()
         except Exception as e:
-            # Fallback: answer without GPT
-            return {
-                "reply": f"Sorry, I couldn't connect to GPT-4o right now ({e}). Please check your API key or billing.",
-                "tickers_fetched": tickers,
-                "context_used": False,
-            }
+            return f"Sorry, I encountered an error: {str(e)[:100]}. Please try again."
 
-    # ── Quick news fetch ────────────────────────────────────────────────────────
-    def get_market_news(self, ticker: str = None, max_articles: int = 8) -> list[dict]:
-        """Fetch and return formatted news for display."""
-        tickers_to_check = [ticker] if ticker else ["SPY", "QQQ"]
-        all_news = []
-        for t in tickers_to_check:
-            news = self.data_agent.fetch_news(t, max_articles=max_articles)
-            for article in news:
-                article["ticker"] = t
-            all_news.extend(news)
-        return all_news[:max_articles]
+    # ── Suggested questions ─────────────────────────────────────────────────────
+    def get_suggestions(self) -> list[str]:
+        return [
+            "What's the latest news on AAPL?",
+            "Give me TSLA current price and recent headlines",
+            "What are the top performing stocks today?",
+            "Explain what RSI means in technical analysis",
+            "Should I buy NVDA based on recent news?",
+            "What's happening in the market today?",
+        ]
